@@ -233,6 +233,18 @@ static EFI_STATUS init_gop(void)
     gFbHeight = gop->Mode->Info->VerticalResolution;
     gFbPitch  = gop->Mode->Info->PixelsPerScanLine;
 
+    /* Zero the framebuffer immediately after SetMode().
+     * In QEMU the VRAM is uninitialized at this moment (random pixels =
+     * static noise).  On real hardware this is usually already zeroed by
+     * the UEFI firmware, but zeroing it here is harmless and guarantees a
+     * clean black frame before any further drawing occurs. */
+    {
+        UINTN sz = (UINTN)gFbHeight * (UINTN)gFbPitch;
+        UINTN i;
+        for (i = 0; i < sz; i++)
+            gFramebuffer[i] = 0x00000000;
+    }
+
     /* Fill boot_info framebuffer */
     g_boot_info_ptr->fb.addr   = (UINT64)gop->Mode->FrameBufferBase;
     g_boot_info_ptr->fb.pitch  = gop->Mode->Info->PixelsPerScanLine * 4;
@@ -245,26 +257,9 @@ static EFI_STATUS init_gop(void)
     return EFI_SUCCESS;
 }
 
-/* ============================================================================
- * Step 2: Fill screen black (kernel handles the real boot splash)
- * ============================================================================ */
-
-/* Draw a filled rectangle */
-static void draw_rect(UINT32 x, UINT32 y, UINT32 w, UINT32 h, UINT32 color)
-{
-    UINT32 row, col;
-    for (row = y; row < y + h && row < gFbHeight; row++)
-        for (col = x; col < x + w && col < gFbWidth; col++)
-            gFramebuffer[row * gFbPitch + col] = color;
-}
-
-static void fill_screen_black(void)
-{
-    draw_rect(0, 0, gFbWidth, gFbHeight, 0x000000);
-}
 
 /* ============================================================================
- * Step 3: Load kernel ELF from FAT32
+ * Step 2: Load kernel ELF from FAT32
  * ============================================================================ */
 static EFI_STATUS load_kernel(UINT64 *entry_point)
 {
@@ -614,11 +609,18 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         return status;
     }
 
-    /* Step 2: Fill screen black (kernel draws the real splash after boot) */
-    fill_screen_black();
+    /* Clear screen to black before loading the kernel.
+     * Without this, the framebuffer shows UEFI firmware residue (noise in
+     * QEMU, firmware logo/text in VirtualBox) for hundreds of milliseconds
+     * while the kernel runs hardware init before boot_splash_init(). */
+    {
+        UINT32 row, col;
+        for (row = 0; row < gFbHeight; row++)
+            for (col = 0; col < gFbWidth; col++)
+                gFramebuffer[row * gFbPitch + col] = 0x00000000;
+    }
 
-    /* Step 3: Load kernel ELF */
-    /* (No screen text — kernel boot splash handles all visuals) */
+    /* Load kernel ELF */
     status = load_kernel(&kernel_entry);
     if (EFI_ERROR(status)) {
         efi_print(u"[FAIL] Kernel load failed\r\n");
