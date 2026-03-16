@@ -159,10 +159,62 @@ static BOOLEAN guid_equal(const EFI_GUID *a, const EFI_GUID *b)
     return 1;
 }
 
-/* --- Helper: print to UEFI console (for debug, before ExitBootServices) --- */
+/* --- Helper: serial port output (0x3F8) for debug on Hyper-V ---
+ * UEFI ConOut may not be visible on Hyper-V Gen2 before ExitBootServices.
+ * Writing to COM1 directly lets us see boot progress via named pipe. */
+#define SERIAL_PORT 0x3F8
+
+static inline void serial_outb(UINT16 port, UINT8 val)
+{
+    __asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
+}
+
+static inline UINT8 serial_inb(UINT16 port)
+{
+    UINT8 ret;
+    __asm__ volatile("inb %1, %0" : "=a"(ret) : "Nd"(port));
+    return ret;
+}
+
+static void serial_init(void)
+{
+    serial_outb(SERIAL_PORT + 1, 0x00);  /* Disable interrupts */
+    serial_outb(SERIAL_PORT + 3, 0x80);  /* DLAB on */
+    serial_outb(SERIAL_PORT + 0, 0x01);  /* Divisor low: 115200 baud */
+    serial_outb(SERIAL_PORT + 1, 0x00);  /* Divisor high */
+    serial_outb(SERIAL_PORT + 3, 0x03);  /* 8N1, DLAB off */
+    serial_outb(SERIAL_PORT + 2, 0xC7);  /* FIFO enable */
+    serial_outb(SERIAL_PORT + 4, 0x03);  /* DTR + RTS */
+}
+
+static void serial_putc(char c)
+{
+    /* Wait for transmit holding register empty */
+    while (!(serial_inb(SERIAL_PORT + 5) & 0x20))
+        ;
+    serial_outb(SERIAL_PORT, (UINT8)c);
+}
+
+static void serial_puts(const char *s)
+{
+    while (*s) {
+        if (*s == '\n') serial_putc('\r');
+        serial_putc(*s++);
+    }
+}
+
+/* --- Helper: print to UEFI console AND serial (for debug) --- */
 static void efi_print(CHAR16 *str)
 {
     gST->ConOut->OutputString(gST->ConOut, str);
+    /* Also write to serial (convert UTF-16 to ASCII) */
+    while (*str) {
+        char c = (char)(*str & 0x7F);
+        if (c == '\r') { str++; continue; }  /* skip \r, serial_puts adds it */
+        if (c == '\n') serial_putc('\r');
+        serial_putc(c);
+        str++;
+    }
 }
 
 /* Helper: print hex number (used for debugging before ExitBootServices) */
@@ -638,6 +690,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     gBS = SystemTable->BootServices;
     gImageHandle = ImageHandle;
 
+    /* Init serial FIRST — before anything else, so we get debug output
+     * even if UEFI ConOut is not visible (Hyper-V Gen2). */
+    serial_init();
+    serial_puts("[BOOT] Impossible OS UEFI bootloader starting\n");
+
     /* Disable watchdog timer (UEFI default: 5 min timeout) */
     gBS->SetWatchdogTimer(0, 0, 0, (CHAR16 *)0);
 
@@ -646,11 +703,14 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     efi_memset(g_boot_info_ptr, 0, sizeof(struct boot_info));
 
     /* Step 1: Initialize graphics */
+    serial_puts("[BOOT] Init GOP...\n");
     status = init_gop();
     if (EFI_ERROR(status)) {
         efi_print(u"[FAIL] Graphics initialization failed\r\n");
+        serial_puts("[BOOT] GOP FAILED\n");
         return status;
     }
+    serial_puts("[BOOT] GOP OK\n");
 
     /* Clear screen to black before loading the kernel.
      * Without this, the framebuffer shows UEFI firmware residue (noise in
@@ -664,46 +724,59 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     }
 
     /* Load kernel ELF */
+    serial_puts("[BOOT] Loading kernel...\n");
     status = load_kernel(&kernel_entry);
     if (EFI_ERROR(status)) {
         efi_print(u"[FAIL] Kernel load failed\r\n");
+        serial_puts("[BOOT] Kernel load FAILED\n");
         return status;
     }
+    serial_puts("[BOOT] Kernel loaded OK\n");
 
     /* Step 4: Find ACPI RSDP */
+    serial_puts("[BOOT] Finding ACPI RSDP...\n");
     find_acpi_rsdp();
 
     /* Step 5: Get UEFI memory map (must be done LAST before ExitBootServices) */
+    serial_puts("[BOOT] Getting memory map...\n");
     status = get_memory_map(&map_key, &mmap, &map_size, &desc_size);
     if (EFI_ERROR(status)) {
         efi_print(u"[FAIL] GetMemoryMap failed\r\n");
+        serial_puts("[BOOT] MemoryMap FAILED\n");
         return status;
     }
 
     /* Convert UEFI memory map to boot_info format */
     fill_memory_map(mmap, map_size, desc_size);
+    serial_puts("[BOOT] Memory map OK\n");
 
     /* Step 6: ExitBootServices — no more UEFI calls after this! */
+    serial_puts("[BOOT] ExitBootServices...\n");
     status = gBS->ExitBootServices(gImageHandle, map_key);
     if (EFI_ERROR(status)) {
         /* Memory map may have changed — retry once */
+        serial_puts("[BOOT] EBS retry...\n");
         status = get_memory_map(&map_key, &mmap, &map_size, &desc_size);
         if (!EFI_ERROR(status)) {
             fill_memory_map(mmap, map_size, desc_size);
             status = gBS->ExitBootServices(gImageHandle, map_key);
         }
         if (EFI_ERROR(status)) {
+            serial_puts("[BOOT] EBS FAILED - HALTING\n");
             /* Fatal — can't exit boot services */
             for (;;) __asm__ volatile("hlt");
         }
     }
+    serial_puts("[BOOT] ExitBootServices OK\n");
 
     /* === NO MORE UEFI CALLS FROM HERE === */
 
     /* Step 7: Set up our own identity-mapped page tables */
+    serial_puts("[BOOT] Setting up page tables...\n");
     setup_page_tables();
 
     /* Step 8: Jump to kernel! */
+    serial_puts("[BOOT] Jumping to kernel!\n");
     jump_to_kernel(kernel_entry);
 
     /* Never reached */
