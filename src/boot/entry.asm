@@ -272,12 +272,15 @@ _start:
     mov esi, err_no_long_mode
     ; fall through to .serial_error
 
-; Print error to COM1 serial port and halt
+; Print error to COM1 serial port and halt (with timeout to prevent hang)
 .serial_error:
     lodsb
     test al, al
     jz .halt32
+    mov ecx, 50000          ; timeout counter — prevent infinite hang if COM1 dead
 .wait_tx:
+    dec ecx
+    jz .halt32              ; give up if COM1 TX never becomes ready
     mov dx, 0x3FD
     in al, dx
     test al, 0x20
