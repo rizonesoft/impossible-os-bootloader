@@ -73,6 +73,15 @@ global _start_efi64
 extern kernel_main
 
 _start:
+    ; ==========================================================================
+    ; DIAGNOSTIC: Write 'K' directly to COM1 to prove we reached _start.
+    ;             No serial init needed — just raw port write.
+    ;             If 'K' appears in Hyper-V serial log, _start was reached.
+    ; ==========================================================================
+    mov dx, 0x3F8
+    mov al, 'K'
+    out dx, al
+
     ; Immediately disable interrupts (GRUB's IDT is stale)
     cli
 
