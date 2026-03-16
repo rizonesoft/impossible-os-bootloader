@@ -47,7 +47,10 @@ $(OUTDIR)/BOOTX64.EFI: bootx64.so
 	    -j .rel -j .rela -j .rel.* -j .rela.* \
 	    -j .reloc \
 	    --target efi-app-x86_64 \
-	    $< $@
+	    $< $@.tmp
+	@# Patch PE headers for Hyper-V: FileAlignment=0x1000, stack/heap reserves
+	python3 $(PROJDIR)/tools/fix-pe-efi.py $@.tmp $@
+	@rm -f $@.tmp
 	@echo "[EFI] $@ created ($$(wc -c < $@ | tr -d ' ') bytes)"
 
 clean:
