@@ -189,8 +189,10 @@ static void serial_init(void)
 
 static void serial_putc(char c)
 {
-    /* Wait for transmit holding register empty */
-    while (!(serial_inb(SERIAL_PORT + 5) & 0x20))
+    /* Wait for transmit holding register empty — with timeout
+     * to avoid infinite hang if COM1 isn't emulated (Hyper-V). */
+    int timeout = 100000;
+    while (!(serial_inb(SERIAL_PORT + 5) & 0x20) && --timeout > 0)
         ;
     serial_outb(SERIAL_PORT, (UINT8)c);
 }
@@ -690,8 +692,16 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     gBS = SystemTable->BootServices;
     gImageHandle = ImageHandle;
 
-    /* Init serial FIRST — before anything else, so we get debug output
-     * even if UEFI ConOut is not visible (Hyper-V Gen2). */
+    /* === ABSOLUTE FIRST OUTPUT — raw ConOut, before ANYTHING else ===
+     * This will be visible on vmconnect/Hyper-V display if the EFI
+     * binary loaded successfully. If you see this text, the bootloader
+     * runs. If not, the PE/COFF binary itself is rejected by firmware. */
+    SystemTable->ConOut->OutputString(
+        SystemTable->ConOut,
+        u"\r\n*** Impossible OS bootloader loaded ***\r\n");
+
+    /* Init serial (COM1 0x3F8) for debug output via named pipe.
+     * Has timeout protection in case COM1 isn't emulated. */
     serial_init();
     serial_puts("[BOOT] Impossible OS UEFI bootloader starting\n");
 
