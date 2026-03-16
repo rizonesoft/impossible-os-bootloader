@@ -69,6 +69,7 @@ MULTIBOOT2_BOOTLOADER_MAGIC equ 0x36D76289
 
 section .text
 global _start
+global _start_efi64
 extern kernel_main
 
 _start:
@@ -88,7 +89,7 @@ _start:
     ; Step 1: Verify Multiboot2 magic
     ; -----------------------------------------------------------------
     cmp eax, MULTIBOOT2_BOOTLOADER_MAGIC
-    jne .error_no_multiboot
+    jne error_no_multiboot
 
     ; -----------------------------------------------------------------
     ; Step 1.5: Zero BSS (must do BEFORE page table setup since
@@ -118,7 +119,7 @@ _start:
     push ecx                ; restore original EFLAGS
     popfd
     cmp eax, ecx            ; if unchanged, CPUID not supported
-    je .error_no_cpuid
+    je error_no_cpuid
 
     ; -----------------------------------------------------------------
     ; Step 3: Check for Long Mode support (CPUID extended function)
@@ -126,12 +127,12 @@ _start:
     mov eax, 0x80000000     ; get highest extended function
     cpuid
     cmp eax, 0x80000001     ; need at least 0x80000001
-    jb .error_no_long_mode
+    jb error_no_long_mode
 
     mov eax, 0x80000001     ; extended processor info
     cpuid
     test edx, 1 << 29       ; LM bit (Long Mode)
-    jz .error_no_long_mode
+    jz error_no_long_mode
 
     ; -----------------------------------------------------------------
     ; Step 4: Set up identity-mapped page tables
@@ -249,38 +250,38 @@ _start:
     call kernel_main
 
     ; If kernel_main returns, halt
-.halt64:
+halt64:
     cli
     hlt
-    jmp .halt64
+    jmp halt64
 
     ; =================================================================
-    ; 32-BIT ERROR HANDLERS
+    ; 32-BIT ERROR HANDLERS (must stay under _start scope for labels)
     ; =================================================================
 
 [BITS 32]
 
-.error_no_multiboot:
+error_no_multiboot:
     mov esi, err_no_multiboot
-    jmp .serial_error
+    jmp serial_error
 
-.error_no_cpuid:
+error_no_cpuid:
     mov esi, err_no_cpuid
-    jmp .serial_error
+    jmp serial_error
 
-.error_no_long_mode:
+error_no_long_mode:
     mov esi, err_no_long_mode
-    ; fall through to .serial_error
+    ; fall through to serial_error
 
 ; Print error to COM1 serial port and halt (with timeout to prevent hang)
-.serial_error:
+serial_error:
     lodsb
     test al, al
-    jz .halt32
+    jz halt32
     mov ecx, 50000          ; timeout counter — prevent infinite hang if COM1 dead
 .wait_tx:
     dec ecx
-    jz .halt32              ; give up if COM1 TX never becomes ready
+    jz halt32               ; give up if COM1 TX never becomes ready
     mov dx, 0x3FD
     in al, dx
     test al, 0x20
@@ -288,12 +289,112 @@ _start:
     mov dx, 0x3F8
     mov al, [esi - 1]
     out dx, al
-    jmp .serial_error
+    jmp serial_error
 
-.halt32:
+halt32:
     cli
     hlt
-    jmp .halt32
+    jmp halt32
+
+; =================================================================
+; EFI 64-BIT ENTRY POINT
+; =================================================================
+; When booted via UEFI (Hyper-V, real hardware), GRUB enters the
+; kernel in 64-bit long mode IF the Multiboot2 header contains
+; the EFI amd64 entry address tag (type 9).
+; CPU state on entry:
+;   - 64-bit long mode, paging enabled (UEFI identity map)
+;   - rax = 0x36D76289 (Multiboot2 magic)
+;   - rbx = physical address of Multiboot2 info structure
+;   - Interrupts disabled
+;
+; We must:
+;   1. Save magic/mbi
+;   2. Set up our own page tables (identity map 4 GiB)
+;   3. Load our GDT
+;   4. Set up stack, zero BSS, call kernel_main()
+;
+; We do NOT need to switch to 32-bit first — we're already in 64-bit.
+
+[BITS 64]
+
+_start_efi64:
+    cli
+
+    ; Save multiboot2 info
+    mov [rel saved_magic], eax
+    mov [rel saved_mbi], ebx
+
+    ; Set up our own page tables (UEFI's may be reclaimed)
+    ; Zero page table memory
+    mov rdi, pml4_table
+    mov rcx, (4096 * 6) / 8     ; 6 pages in qwords
+    xor rax, rax
+    rep stosq
+
+    ; PML4[0] -> PDPT
+    mov rax, pdpt_table
+    or rax, 0x07
+    mov [pml4_table], rax
+
+    ; PDPT[0..3] -> PD[0..3]
+    mov rax, pd_tables
+    or rax, 0x07
+    mov [pdpt_table + 0*8], rax
+    add rax, 4096
+    mov [pdpt_table + 1*8], rax
+    add rax, 4096
+    mov [pdpt_table + 2*8], rax
+    add rax, 4096
+    mov [pdpt_table + 3*8], rax
+
+    ; Fill PDs with 2 MiB identity pages
+    mov rdi, pd_tables
+    mov rax, 0x0000000000000087   ; Present + Writable + User + PS(2MiB)
+    mov rcx, 512 * 4              ; 2048 entries
+.efi_fill_pd:
+    mov [rdi], rax
+    add rax, 0x200000
+    add rdi, 8
+    dec rcx
+    jnz .efi_fill_pd
+
+    ; Load our page tables
+    mov rax, pml4_table
+    mov cr3, rax
+
+    ; Load our 64-bit GDT
+    lgdt [gdt64_pointer]
+
+    ; Reload segment registers with our GDT selectors
+    mov ax, DATA64_SEG
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ss, ax
+
+    ; Zero BSS
+    mov rdi, __bss_start
+    mov rcx, __bss_end
+    sub rcx, rdi
+    shr rcx, 3              ; divide by 8 (zero in qwords)
+    xor rax, rax
+    rep stosq
+
+    ; Set up stack
+    mov rsp, stack_top
+
+    ; Call kernel_main(magic, mbi_pointer)
+    xor rdi, rdi
+    xor rsi, rsi
+    mov edi, [saved_magic]
+    mov esi, [saved_mbi]
+
+    call kernel_main
+
+    ; If kernel_main returns, halt
+    jmp halt64
 
 ; --- Save area for multiboot info (written in 32-bit, read in 64-bit) ---
 section .data

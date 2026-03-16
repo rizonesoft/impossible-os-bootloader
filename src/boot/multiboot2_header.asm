@@ -25,6 +25,16 @@ multiboot2_header_start:
     dd 720                      ; preferred height
     dd 32                       ; preferred bpp
 
+    ; --- EFI amd64 entry address tag (type 9) ---
+    ; Tells GRUB to enter kernel in 64-bit long mode on UEFI systems.
+    ; Without this, GRUB must switch 64→32 bit which fails on Hyper-V.
+    align 8
+    extern _start_efi64
+    dw 9                        ; type = EFI amd64 entry address
+    dw 0                        ; flags (not optional)
+    dd 12                       ; size of this tag
+    dd _start_efi64             ; 64-bit entry point address
+
     ; --- End tag ---
     align 8
     dw 0                        ; type = end tag
